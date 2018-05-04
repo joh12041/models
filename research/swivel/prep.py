@@ -46,22 +46,16 @@ Options:
       Use the specified unigram vocabulary instead of generating
       it from the corpus.
 
-  --window_size <int>
-      Specifies the window size for computing co-occurrence stats;
-      default 10.
-
   --bufsz <int>
       The number of co-occurrences that are buffered; default 16M.
 
 """
 
-import itertools
-import math
 import os
+import csv
 import struct
 import sys
 
-from six.moves import xrange
 import tensorflow as tf
 
 flags = tf.app.flags
@@ -69,13 +63,20 @@ flags = tf.app.flags
 flags.DEFINE_string('input', '', 'The input text.')
 flags.DEFINE_string('output_dir', '/tmp/swivel_data',
                     'Output directory for Swivel data')
+flags.DEFINE_integer('row_idx', 0, '0-based index for which field in input '
+                     'contains row tokens')
+flags.DEFINE_integer('col_idx', 1, '0-based index for which field in input '
+                     'contains column tokens')
+flags.DEFINE_integer('count_idx', 2, '0-based index for which field in input '
+                     'contains counts. If < 0, assume no field and each line '
+                     'is a single count.')
 flags.DEFINE_integer('shard_size', 4096, 'The size for each shard')
 flags.DEFINE_integer('min_count', 5,
                      'The minimum number of times a word should occur to be '
                      'included in the vocabulary')
 flags.DEFINE_integer('max_vocab', 4096 * 64, 'The maximum vocabulary size')
-flags.DEFINE_string('vocab', '', 'Vocabulary to use instead of generating one')
-flags.DEFINE_integer('window_size', 10, 'The window size')
+flags.DEFINE_string('row_vocab', '', 'Row vocabulary to use instead of generating one')
+flags.DEFINE_string('col_vocab', '', 'Column vocabulary to use instead of generating one')
 flags.DEFINE_integer('bufsz', 16 * 1024 * 1024,
                      'The number of co-occurrences to buffer')
 
@@ -84,124 +85,117 @@ FLAGS = flags.FLAGS
 shard_cooc_fmt = struct.Struct('iif')
 
 
-def words(line):
-  """Splits a line of text into tokens."""
-  return line.strip().split()
-
-
 def create_vocabulary(lines):
   """Reads text lines and generates a vocabulary."""
-  lines.seek(0, os.SEEK_END)
-  nbytes = lines.tell()
-  lines.seek(0, os.SEEK_SET)
+  row_vocab = {}
+  col_vocab = {}
+  csvreader = csv.reader(lines)
+  for line in csvreader:
+    row_tok = line[FLAGS.row_idx]
+    col_tok = line[FLAGS.col_idx]
+    row_vocab.setdefault(row_tok, 0)
+    col_vocab.setdefault(col_tok, 0)
+    if FLAGS.count_idx > 0:
+      count = float(line[FLAGS.count_idx])
+      row_vocab[row_tok] += count
+      col_vocab[col_tok] += count
+    else:
+      row_vocab[row_tok] += 1
+      col_vocab[col_tok] += 1
 
-  vocab = {}
-  for lineno, line in enumerate(lines, start=1):
-    for word in words(line):
-      vocab.setdefault(word, 0)
-      vocab[word] += 1
+  row_vocab = [(tok, n) for tok, n in row_vocab.items() if n >= FLAGS.min_count]
+  row_vocab.sort(key=lambda kv: (-kv[1], kv[0]))
+  col_vocab = [(tok, n) for tok, n in col_vocab.items() if n >= FLAGS.min_count]
+  col_vocab.sort(key=lambda kv: (-kv[1], kv[0]))
 
-    if lineno % 100000 == 0:
-      pos = lines.tell()
-      sys.stdout.write('\rComputing vocabulary: %0.1f%% (%d/%d)...' % (
-          100.0 * pos / nbytes, pos, nbytes))
-      sys.stdout.flush()
+  num_row_toks = min(len(row_vocab), FLAGS.max_vocab)
+  num_col_toks = min(len(col_vocab), FLAGS.max_vocab)
+  if num_row_toks % FLAGS.shard_size != 0:
+    #num_row_toks -= num_row_toks % FLAGS.shard_size
+    num_row_toks += FLAGS.shard_size - (num_row_toks % FLAGS.shard_size)
+  if num_col_toks % FLAGS.shard_size != 0:
+    #num_col_toks -= num_col_toks % FLAGS.shard_size
+    num_col_toks += FLAGS.shard_size - (num_col_toks % FLAGS.shard_size)
 
-  sys.stdout.write('\n')
+  if not num_row_toks:
+    raise Exception('empty row vocabulary')
+  if not num_col_toks:
+    raise Exception('empty column vocabulary')
 
-  vocab = [(tok, n) for tok, n in vocab.iteritems() if n >= FLAGS.min_count]
-  vocab.sort(key=lambda kv: (-kv[1], kv[0]))
+  print('row vocabulary contains %d tokens (original %d)' % (num_row_toks, len(row_vocab)))
+  print('column vocabulary contains %d tokens (original %d)' % (num_col_toks, len(col_vocab)))
 
-  num_words = min(len(vocab), FLAGS.max_vocab)
-  if num_words % FLAGS.shard_size != 0:
-    num_words -= num_words % FLAGS.shard_size
-
-  if not num_words:
-    raise Exception('empty vocabulary')
-
-  print('vocabulary contains %d tokens' % num_words)
-
-  vocab = vocab[:num_words]
-  return [tok for tok, n in vocab]
+  #row_vocab = row_vocab[:num_row_toks]
+  for i in range(num_row_toks - len(row_vocab)):
+    row_vocab.append(('ROWPADDING_{0}'.format(i) , 0))
+  #col_vocab = col_vocab[:num_col_toks]
+  for i in range(num_col_toks - len(col_vocab)):
+    col_vocab.append(('COLPADDING_{0}'.format(i) , 0))
+  return [tok for tok, n in row_vocab], [tok for tok, n in col_vocab]
 
 
 def write_vocab_and_sums(vocab, sums, vocab_filename, sums_filename):
   """Writes vocabulary and marginal sum files."""
   with open(os.path.join(FLAGS.output_dir, vocab_filename), 'w') as vocab_out:
     with open(os.path.join(FLAGS.output_dir, sums_filename), 'w') as sums_out:
-      for tok, cnt in itertools.izip(vocab, sums):
-        print >> vocab_out, tok
-        print >> sums_out, cnt
+      for tok, cnt in zip(vocab, sums):
+        print(tok, file=vocab_out)
+        print(cnt, file=sums_out)
 
 
-def compute_coocs(lines, vocab):
+def compute_coocs(lines, row_vocab, col_vocab):
   """Compute the co-occurrence statistics from the text.
 
   This generates a temporary file for each shard that contains the intermediate
   counts from the shard: these counts must be subsequently sorted and collated.
 
   """
-  word_to_id = {tok: idx for idx, tok in enumerate(vocab)}
+  row_word_to_id = {tok: idx for idx, tok in enumerate(row_vocab)}
+  col_word_to_id = {tok: idx for idx, tok in enumerate(col_vocab)}
 
-  lines.seek(0, os.SEEK_END)
-  nbytes = lines.tell()
-  lines.seek(0, os.SEEK_SET)
-
-  num_shards = len(vocab) / FLAGS.shard_size
+  r_num_shards = len(row_vocab) // FLAGS.shard_size
+  c_num_shards = len(col_vocab) // FLAGS.shard_size
 
   shardfiles = {}
-  for row in range(num_shards):
-    for col in range(num_shards):
+  for row in range(r_num_shards):
+    for col in range(c_num_shards):
       filename = os.path.join(
           FLAGS.output_dir, 'shard-%03d-%03d.tmp' % (row, col))
 
-      shardfiles[(row, col)] = open(filename, 'w+')
+      shardfiles[(row, col)] = open(filename, 'wb+')
 
   def flush_coocs():
-    for (row_id, col_id), cnt in coocs.iteritems():
-      row_shard = row_id % num_shards
-      row_off = row_id / num_shards
-      col_shard = col_id % num_shards
-      col_off = col_id / num_shards
+    for (row_id, col_id), cnt in coocs.items():
+      row_shard = row_id % r_num_shards
+      row_off = row_id % FLAGS.shard_size
+      col_shard = col_id % c_num_shards
+      col_off = col_id % FLAGS.shard_size
 
-      # Since we only stored (a, b), we emit both (a, b) and (b, a).
       shardfiles[(row_shard, col_shard)].write(
           shard_cooc_fmt.pack(row_off, col_off, cnt))
 
-      shardfiles[(col_shard, row_shard)].write(
-          shard_cooc_fmt.pack(col_off, row_off, cnt))
-
   coocs = {}
-  sums = [0.0] * len(vocab)
+  row_sums = [0.0] * len(row_vocab)
+  col_sums = [0.0] * len(col_vocab)
 
-  for lineno, line in enumerate(lines, start=1):
-    # Computes the word IDs for each word in the sentence.  This has the effect
-    # of "stretching" the window past OOV tokens.
-    wids = filter(
-        lambda wid: wid is not None,
-        (word_to_id.get(w) for w in words(line)))
-
-    for pos in xrange(len(wids)):
-      lid = wids[pos]
-      window_extent = min(FLAGS.window_size + 1, len(wids) - pos)
-      for off in xrange(1, window_extent):
-        rid = wids[pos + off]
-        pair = (min(lid, rid), max(lid, rid))
-        count = 1.0 / off
-        sums[lid] += count
-        sums[rid] += count
-        coocs.setdefault(pair, 0.0)
-        coocs[pair] += count
-
-      sums[lid] += 1.0
-      pair = (lid, lid)
-      coocs.setdefault(pair, 0.0)
-      coocs[pair] += 0.5  # Only add 1/2 since we output (a, b) and (b, a)
+  csvreader = csv.reader(lines)
+  for lineno, line in enumerate(csvreader, start=1):
+    rid = row_word_to_id.get(line[FLAGS.row_idx], None)
+    cid = col_word_to_id.get(line[FLAGS.col_idx], None)
+    if rid is None or cid is None:
+      continue
+    pair = (min(rid, cid), max(rid, cid))
+    if FLAGS.count_idx > 0:
+      count = float(line[FLAGS.count_idx])
+    else:
+      count = 1
+    row_sums[rid] += count
+    col_sums[cid] += count
+    coocs.setdefault(pair, 0.0)
+    coocs[pair] += count
 
     if lineno % 10000 == 0:
-      pos = lines.tell()
-      sys.stdout.write('\rComputing co-occurrences: %0.1f%% (%d/%d)...' % (
-          100.0 * pos / nbytes, pos, nbytes))
+      sys.stdout.write('\rComputing co-occurrences: %d lines processed...' % lineno)
       sys.stdout.flush()
 
       if len(coocs) > FLAGS.bufsz:
@@ -211,20 +205,21 @@ def compute_coocs(lines, vocab):
   flush_coocs()
   sys.stdout.write('\n')
 
-  return shardfiles, sums
+  return shardfiles, row_sums, col_sums
 
 
-def write_shards(vocab, shardfiles):
+def write_shards(row_vocab, col_vocab, shardfiles):
   """Processes the temporary files to generate the final shard data.
 
   The shard data is stored as a tf.Example protos using a TFRecordWriter. The
   temporary files are removed from the filesystem once they've been processed.
 
   """
-  num_shards = len(vocab) / FLAGS.shard_size
+  num_row_shards = len(row_vocab) // FLAGS.shard_size
+  num_col_shards = len(col_vocab) // FLAGS.shard_size
 
   ix = 0
-  for (row, col), fh in shardfiles.iteritems():
+  for (row, col), fh in shardfiles.items():
     ix += 1
     sys.stdout.write('\rwriting shard %d/%d' % (ix, len(shardfiles)))
     sys.stdout.flush()
@@ -270,9 +265,9 @@ def write_shards(vocab, shardfiles):
 
     example = tf.train.Example(features=tf.train.Features(feature={
         'global_row': _int64s(
-            row + num_shards * i for i in range(FLAGS.shard_size)),
+            row + num_row_shards * i for i in range(FLAGS.shard_size)),
         'global_col': _int64s(
-            col + num_shards * i for i in range(FLAGS.shard_size)),
+            col + num_col_shards * i for i in range(FLAGS.shard_size)),
 
         'sparse_local_row': _int64s(cooc[0] for cooc in coocs),
         'sparse_local_col': _int64s(cooc[1] for cooc in coocs),
@@ -280,7 +275,7 @@ def write_shards(vocab, shardfiles):
     }))
 
     filename = os.path.join(FLAGS.output_dir, 'shard-%03d-%03d.pb' % (row, col))
-    with open(filename, 'w') as out:
+    with open(filename, 'wb') as out:
       out.write(example.SerializeToString())
 
   sys.stdout.write('\n')
@@ -292,23 +287,27 @@ def main(_):
     os.makedirs(FLAGS.output_dir)
 
   # Read the file onces to create the vocabulary.
-  if FLAGS.vocab:
-    with open(FLAGS.vocab, 'r') as lines:
-      vocab = [line.strip() for line in lines]
-  else:
+  if not FLAGS.row_vocab or not FLAGS.col_vocab:
     with open(FLAGS.input, 'r') as lines:
-      vocab = create_vocabulary(lines)
+      row_vocab, col_vocab = create_vocabulary(lines)
+  elif FLAGS.row_vocab:
+    with open(FLAGS.row_vocab, 'r') as lines:
+      row_vocab = [line.strip() for line in lines]
+  elif FLAGS.col_vocab:
+    with open(FLAGS.col_vocab, 'r') as lines:
+      col_vocab = [line.strip() for line in lines]
+
 
   # Now read the file again to determine the co-occurrence stats.
   with open(FLAGS.input, 'r') as lines:
-    shardfiles, sums = compute_coocs(lines, vocab)
+    shardfiles, row_sums, col_sums = compute_coocs(lines, row_vocab, col_vocab)
 
   # Collect individual shards into the shards.recs file.
-  write_shards(vocab, shardfiles)
+  write_shards(row_vocab, col_vocab, shardfiles)
 
-  # Now write the marginals.  They're symmetric for this application.
-  write_vocab_and_sums(vocab, sums, 'row_vocab.txt', 'row_sums.txt')
-  write_vocab_and_sums(vocab, sums, 'col_vocab.txt', 'col_sums.txt')
+  # Now write the marginals.
+  write_vocab_and_sums(row_vocab, row_sums, 'row_vocab.txt', 'row_sums.txt')
+  write_vocab_and_sums(col_vocab, col_sums, 'col_vocab.txt', 'col_sums.txt')
 
   print('done!')
 

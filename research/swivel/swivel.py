@@ -55,7 +55,6 @@ from __future__ import division
 from __future__ import print_function
 
 import glob
-import itertools
 import os
 import random
 
@@ -112,7 +111,6 @@ flags.DEFINE_integer(
     'gpu_device', 0, 'The GPU device to use.')
 
 FLAGS = flags.FLAGS
-
 
 class Model(object):
   """A Swivel model."""
@@ -349,7 +347,7 @@ class Model(object):
 
     def _op(preds_ixs):
       correct, total = 0, 0
-      for pred_ixs, actual_ixs in itertools.izip(preds_ixs, analogy_ixs):
+      for pred_ixs, actual_ixs in zip(preds_ixs, analogy_ixs):
         pred_ixs = [ix for ix in pred_ixs if ix not in actual_ixs[:3]]
         correct += pred_ixs[0] == actual_ixs[3]
         total += 1
